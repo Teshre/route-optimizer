@@ -2,6 +2,10 @@
 
 Optimize last-mile delivery routes for a distribution operation: decide **which clients go on which truck, and in what order**, while respecting each truck's volume capacity and the shift's time limit. The goal is fewer kilometers driven, balanced truck loads, and delivery schedules that actually fit the working day.
 
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://route-optimizer-demo.streamlit.app/) [![CI](https://github.com/Teshre/route-optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/Teshre/route-optimizer/actions/workflows/ci.yml)
+
+**▶ Live demo: [route-optimizer-demo.streamlit.app](https://route-optimizer-demo.streamlit.app/)**
+
 ---
 
 ## What it does
@@ -44,7 +48,7 @@ Run `make help` to see all available targets.
 
 ## 🌐 Live demo
 
-**Coming soon** — a hosted Streamlit dashboard link will go here.
+**[route-optimizer-demo.streamlit.app](https://route-optimizer-demo.streamlit.app/)** — the hosted dashboard: pick a random client set and see the optimized routes on an interactive map, the per-truck KPIs, and the charts. It generates the synthetic sample on load, so nothing needs to be uploaded.
 
 ---
 
