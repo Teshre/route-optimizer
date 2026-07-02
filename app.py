@@ -1,473 +1,629 @@
 """
-Dashboard Interactivo - Optimización de Rutas de Distribución
+Route Optimizer V2 — Streamlit dashboard.
+
+Interactive front-end for the CVRPTW route optimizer. It runs BOTH a naive
+baseline (K-Means + nearest-neighbor, time windows ignored) and the OR-Tools
+CVRPTW solver, then shows a baseline-vs-optimized benchmark, the optimized
+routes on a Folium map, Plotly charts, and per-route tables.
+
+The heavy lifting lives in the ``route_optimizer`` package (``src/``); this
+file is presentation only. It is intentionally defensive so a fresh Streamlit
+Community Cloud deploy works: it generates the dataset on first run and shows a
+friendly message if an optional dependency is missing.
 """
+
+from __future__ import annotations
+
+import importlib.util
 import os
 import sys
-import importlib.util
 
 import streamlit as st
-import pandas as pd
-import numpy as np
-from math import radians, sin, cos, sqrt, atan2
-from sklearn.cluster import KMeans
-from datetime import datetime, timedelta
-import folium
-from streamlit_folium import st_folium
-import plotly.express as px
-import plotly.graph_objects as go
 
-# Repo-relative paths (works regardless of the current working directory).
+# ---------------------------------------------------------------------------
+# Paths & package import (src-layout)
+# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, 'data', 'clientes.csv')
-GENERATOR_PATH = os.path.join(BASE_DIR, 'data', 'generate_data.py')
+SRC_DIR = os.path.join(BASE_DIR, "src")
+DATA_PATH = os.path.join(BASE_DIR, "data", "clientes.csv")
+GENERATOR_PATH = os.path.join(BASE_DIR, "data", "generate_data.py")
+
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+st.set_page_config(page_title="Route Optimizer V2 — CVRPTW", page_icon="🚚", layout="wide")
+
+# Per-vehicle colours (extended so larger fleets still get distinct colours).
+COLORS = [
+    "#e74c3c", "#3498db", "#2ecc71", "#f39c12",
+    "#9b59b6", "#1abc9c", "#e67e22", "#34495e",
+    "#c0392b", "#2980b9",
+]
 
 
-def _ensure_data():
-    """Ensure data/clientes.csv exists; generate it on first run if missing.
+def _color(i: int) -> str:
+    return COLORS[i % len(COLORS)]
 
-    This keeps the demo working on a fresh clone / Streamlit Community Cloud
-    deploy where only the committed sample may be absent.
+
+# ---------------------------------------------------------------------------
+# Guarded heavy imports — a missing optional dep shows a friendly message
+# instead of a raw traceback on the hosted demo.
+# ---------------------------------------------------------------------------
+def _friendly_import_error(exc: Exception) -> None:
+    st.error(
+        "⚠️ A required dependency could not be imported, so the optimizer cannot "
+        "run in this environment.\n\n"
+        f"**Details:** `{exc}`\n\n"
+        "Install everything with `pip install -r requirements.txt` "
+        "(the OR-Tools solver in particular needs the `ortools` wheel)."
+    )
+    st.stop()
+
+
+try:
+    import pandas as pd
+    import numpy as np
+    import folium
+    from streamlit_folium import st_folium
+    import plotly.graph_objects as go
+
+    # Solver / KPI entry points are re-exported from the package root by
+    # __init__.py. Depot + depart constants and provider names live in config
+    # (guaranteed to exist), so import them from there directly to keep this
+    # file working even if the package root re-exports change.
+    from route_optimizer import (
+        solve_baseline,
+        solve_cvrptw,
+        compute_kpis,
+        benchmark,
+    )
+    from route_optimizer.config import (
+        DEPOT_LAT,
+        DEPOT_LON,
+        DEPART,
+        PROVIDER_HAVERSINE,
+        PROVIDER_OSRM,
+        load_clients,
+    )
+except Exception as exc:  # noqa: BLE001 — surface any import failure kindly
+    _friendly_import_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Data bootstrap
+# ---------------------------------------------------------------------------
+def _ensure_data() -> None:
+    """Generate ``data/clientes.csv`` on first run if it is missing.
+
+    Imports the standalone generator by file path, registering it in
+    ``sys.modules`` first so anything it references resolves cleanly.
     """
     if os.path.exists(DATA_PATH):
         return
     spec = importlib.util.spec_from_file_location("generate_data", GENERATOR_PATH)
     module = importlib.util.module_from_spec(spec)
-    # Register before exec so any dataclasses / pickling inside resolve cleanly.
     sys.modules["generate_data"] = module
     spec.loader.exec_module(module)
     module.generate()
 
-# ============================================================================
-# CONFIGURACIÓN
-# ============================================================================
-st.set_page_config(
-    page_title="Route Optimizer",
-    page_icon="🚚",
-    layout="wide"
-)
 
-# Constantes
-CENTRO_DIST = {'lat': 19.37709580527042, 'lon': -99.58287448741568}
-CAPACIDAD_CAMION = 12000
-NUM_CAMIONES = 4
-TIEMPO_SERVICIO = 10
-VELOCIDAD_MAXIMA = 50
-HORA_INICIO = "08:00"
-JORNADA_MAXIMA = 630  # minutos
-
-# Colores para rutas
-COLORES = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12']
-
-# ============================================================================
-# FUNCIONES
-# ============================================================================
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371
-    phi1, phi2 = radians(lat1), radians(lat2)
-    delta_phi = radians(lat2 - lat1)
-    delta_lambda = radians(lon2 - lon1)
-    a = sin(delta_phi/2)**2 + cos(phi1) * cos(phi2) * sin(delta_lambda/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1-a))
-    return R * c
-
-def nearest_neighbor(matriz_dist, indices):
-    n = len(indices)
-    if n == 0:
-        return [], 0
-    visitados = [False] * n
-    ruta = [0]
-    visitados_clientes = []
-    
-    actual = 0
-    distancia_total = 0
-    
-    while len(visitados_clientes) < n:
-        mejor_dist = float('inf')
-        mejor_idx = -1
-        
-        for i, idx in enumerate(indices):
-            if not visitados[i]:
-                d = matriz_dist[actual][i + 1]
-                if d < mejor_dist:
-                    mejor_dist = d
-                    mejor_idx = i
-        
-        if mejor_idx != -1:
-            visitados[mejor_idx] = True
-            visitados_clientes.append(mejor_idx)
-            distancia_total += mejor_dist
-            actual = mejor_idx + 1
-    
-    distancia_total += matriz_dist[actual][0]
-    return visitados_clientes, distancia_total
-
-@st.cache_data
-def cargar_datos():
+@st.cache_data(show_spinner=False)
+def _load_full_dataset() -> "pd.DataFrame":
     _ensure_data()
-    df = pd.read_csv(DATA_PATH, encoding='utf-8')
-    original_count = len(df)
-    
-    # Convertir coordenadas
-    df['Latitud'] = pd.to_numeric(df['Latitud'], errors='coerce')
-    df['Longitud'] = pd.to_numeric(df['Longitud'], errors='coerce')
-    
-    # Contar registros con errores
-    nan_count = df[['Latitud', 'Longitud']].isna().any(axis=1).sum()
-    
-    # Corregir signos (Toluca: lat positiva ~19, lon negativa ~-99)
-    df['Latitud'] = df['Latitud'].abs()
-    df['Longitud'] = -df['Longitud'].abs()
-    
-    # Eliminar registros con NaN
-    df = df.dropna(subset=['Latitud', 'Longitud'])
-    
-    return df, original_count, nan_count
+    return load_clients(DATA_PATH)
 
-def optimizar_rutas(df_clientes):
-    coords = df_clientes[['Latitud', 'Longitud']].values
-    kmeans = KMeans(n_clusters=NUM_CAMIONES, random_state=42, n_init=10)
-    df_clientes = df_clientes.copy()
-    df_clientes['Cluster'] = kmeans.fit_predict(coords)
-    
-    rutas = {}
-    for c in range(NUM_CAMIONES):
-        mask = df_clientes['Cluster'] == c
-        clientes_cluster = df_clientes[mask]
-        indices = clientes_cluster.index.tolist()
-        
-        if len(indices) == 0:
-            rutas[c] = {'clientes': pd.DataFrame(), 'distancia': 0, 'tiempo': 0}
-            continue
-        
-        n = len(indices) + 1
-        matriz = np.zeros((n, n))
-        
-        for i in range(n):
-            for j in range(n):
-                if i == 0:
-                    lat1, lon1 = CENTRO_DIST['lat'], CENTRO_DIST['lon']
-                else:
-                    lat1 = clientes_cluster.iloc[i-1]['Latitud']
-                    lon1 = clientes_cluster.iloc[i-1]['Longitud']
-                
-                if j == 0:
-                    lat2, lon2 = CENTRO_DIST['lat'], CENTRO_DIST['lon']
-                else:
-                    lat2 = clientes_cluster.iloc[j-1]['Latitud']
-                    lon2 = clientes_cluster.iloc[j-1]['Longitud']
-                
-                matriz[i][j] = haversine(lat1, lon1, lat2, lon2)
-        
-        orden, distancia = nearest_neighbor(matriz, list(range(len(indices))))
-        clientes_ordenados = clientes_cluster.iloc[orden].reset_index(drop=True)
-        
-        hora = datetime.strptime(HORA_INICIO, "%H:%M")
-        lat_ant, lon_ant = CENTRO_DIST['lat'], CENTRO_DIST['lon']
-        horarios = []
-        
-        for _, cliente in clientes_ordenados.iterrows():
-            dist = haversine(lat_ant, lon_ant, cliente['Latitud'], cliente['Longitud'])
-            tiempo_viaje = (dist / VELOCIDAD_MAXIMA) * 60
-            hora += timedelta(minutes=tiempo_viaje)
-            horarios.append(hora.strftime("%H:%M"))
-            hora += timedelta(minutes=TIEMPO_SERVICIO)
-            lat_ant, lon_ant = cliente['Latitud'], cliente['Longitud']
-        
-        clientes_ordenados['Hora Llegada'] = horarios
-        clientes_ordenados['Orden'] = range(1, len(clientes_ordenados) + 1)
-        
-        tiempo_total = len(indices) * TIEMPO_SERVICIO + (distancia / VELOCIDAD_MAXIMA) * 60 + 40
-        
-        rutas[c] = {
-            'clientes': clientes_ordenados,
-            'distancia': distancia,
-            'tiempo': tiempo_total
-        }
-    
-    return df_clientes, rutas
 
-def crear_mapa(df_clientes, rutas):
-    m = folium.Map(location=[19.30, -99.65], zoom_start=12, tiles='CartoDB positron')
-    
-    folium.Marker(
-        [CENTRO_DIST['lat'], CENTRO_DIST['lon']],
-        popup="Centro de Distribución",
-        icon=folium.Icon(color='black', icon='home')
-    ).add_to(m)
-    
-    for c in range(NUM_CAMIONES):
-        if rutas[c]['clientes'].empty:
-            continue
-        
-        coords = [[CENTRO_DIST['lat'], CENTRO_DIST['lon']]]
-        
-        for _, cliente in rutas[c]['clientes'].iterrows():
-            lat, lon = cliente['Latitud'], cliente['Longitud']
-            coords.append([lat, lon])
-            
-            popup_html = f"""
-            <div style="width:280px; font-family: Arial;">
-                <div style="background:{COLORES[c]};color:white;padding:8px;margin:-10px -10px 10px -10px;border-radius:5px 5px 0 0;">
-                    <b>🚚 Ruta {c+1} - Parada {cliente['Orden']}</b>
-                </div>
-                <table style="width:100%; font-size:12px;">
-                    <tr><td><b>📍 Cliente:</b></td><td>{cliente['NombreCliente']}</td></tr>
-                    <tr><td><b>📫 Dirección:</b></td><td>{str(cliente['Direccion'])[:40]}...</td></tr>
-                    <tr><td><b>🌐 Coordenadas:</b></td><td>{lat:.6f}, {lon:.6f}</td></tr>
-                    <tr><td><b>📦 Volumen:</b></td><td>{cliente['Volumen estimado en litros']} L</td></tr>
-                    <tr><td><b>⏰ Ventana:</b></td><td>{cliente['VentanaServicio']}</td></tr>
-                    <tr><td><b>🕐 Llegada:</b></td><td><b style="color:{COLORES[c]}">{cliente['Hora Llegada']}</b></td></tr>
-                </table>
-            </div>
-            """
-            
-            folium.CircleMarker(
-                [lat, lon],
-                radius=8,
-                popup=folium.Popup(popup_html, max_width=300),
-                color=COLORES[c],
-                fill=True,
-                fill_opacity=0.7,
-                tooltip=f"🚚 Ruta {c+1} | Cliente {cliente['NombreCliente']} | {cliente['Hora Llegada']}"
-            ).add_to(m)
-        
-        coords.append([CENTRO_DIST['lat'], CENTRO_DIST['lon']])
-        folium.PolyLine(coords, color=COLORES[c], weight=3, opacity=0.8).add_to(m)
-    
-    return m
+# Solving is the expensive step — cache on the exact parameter set + client set.
+@st.cache_data(show_spinner=False)
+def _solve_both(
+    signature: tuple,
+    _df: "pd.DataFrame",
+    provider: str,
+    num_vehicles: int,
+    capacity: int,
+    service_time: int,
+    shift_minutes: int,
+):
+    """Run baseline + CVRPTW and compute KPIs. ``signature`` keys the cache;
+    ``_df`` is passed with a leading underscore so Streamlit does not try to
+    hash the whole DataFrame."""
+    baseline_sol = solve_baseline(
+        _df,
+        provider=provider,
+        num_vehicles=num_vehicles,
+        capacity=capacity,
+        service_time=service_time,
+        shift_minutes=shift_minutes,
+    )
+    optimized_sol = solve_cvrptw(
+        _df,
+        provider=provider,
+        num_vehicles=num_vehicles,
+        capacity=capacity,
+        service_time=service_time,
+        shift_minutes=shift_minutes,
+    )
+    baseline_kpis = compute_kpis(baseline_sol, _df)
+    optimized_kpis = compute_kpis(optimized_sol, _df)
+    bench = benchmark(baseline_sol, optimized_sol)
+    return baseline_sol, optimized_sol, baseline_kpis, optimized_kpis, bench
 
-# ============================================================================
-# DASHBOARD
-# ============================================================================
-st.title("🚚 Optimización de Rutas de Distribución")
 
-# Cargar datos
-df, original_count, nan_count = cargar_datos()
+# ---------------------------------------------------------------------------
+# Small helpers to read the Solution / KPI shapes defensively
+# ---------------------------------------------------------------------------
+def _fmt_hhmm(minutes_from_depart) -> str:
+    """Render minutes-from-DEPART as a wall-clock ``HH:MM`` string."""
+    try:
+        m = int(round(float(minutes_from_depart)))
+    except (TypeError, ValueError):
+        return "—"
+    dh, dm = int(DEPART.split(":")[0]), int(DEPART.split(":")[1])
+    total = dh * 60 + dm + m
+    total %= 24 * 60
+    return f"{total // 60:02d}:{total % 60:02d}"
 
-# Alerta de limpieza de datos
-st.warning(f"""⚠️ **Limpieza de datos realizada:**
-- **Registros originales:** {original_count}
-- **Problema detectado:** Algunas coordenadas tenían signos incorrectos (latitudes negativas, longitudes positivas)
-- **Impacto:** Sin corrección, los puntos aparecían en el **hemisferio sur** (Sudamérica) en lugar de Toluca, México
-- **Corrección aplicada:** Latitudes → positivas (~19°N), Longitudes → negativas (~99°W)
-- **Registros con datos faltantes:** {nan_count}
-""")
 
-st.markdown("---")
+def _minutes_to_hrs(minutes) -> float:
+    try:
+        return float(minutes) / 60.0
+    except (TypeError, ValueError):
+        return 0.0
 
-# Sidebar
+
+# ---------------------------------------------------------------------------
+# Sidebar — interactive parameters
+# ---------------------------------------------------------------------------
+df_full = _load_full_dataset()
+n_available = len(df_full)
+
 with st.sidebar:
-    st.header("⚙️ Selección de Clientes")
-    
-    if st.button("🎲 Nueva Selección Aleatoria", type="primary", use_container_width=True):
-        st.session_state['seed'] = np.random.randint(1, 10000)
-    
-    if 'seed' not in st.session_state:
-        st.session_state['seed'] = 42
-    
-    st.caption(f"Grupo de clientes #{st.session_state['seed']}")
-    
-    st.markdown("---")
-    st.markdown("### 📊 Parámetros Operativos")
-    st.markdown(f"- 🚚 **Unidades:** {NUM_CAMIONES}")
-    st.markdown(f"- 📦 **Capacidad:** {CAPACIDAD_CAMION:,} L/unidad")
-    st.markdown(f"- ⚡ **Velocidad:** {VELOCIDAD_MAXIMA} km/h")
-    st.markdown(f"- ⏱️ **Servicio:** {TIEMPO_SERVICIO} min/cliente")
-    st.markdown(f"- 🕐 **Horario:** 8:00 - 18:30")
+    st.header("⚙️ Parameters")
 
-# Selección y optimización
-clientes_seleccionados = df.sample(n=50, random_state=st.session_state['seed']).reset_index(drop=True)
-df_optimizado, rutas = optimizar_rutas(clientes_seleccionados)
-
-# Métricas principales
-st.subheader("📈 Métricas Globales")
-col1, col2, col3, col4, col5 = st.columns(5)
-
-total_km = sum(r['distancia'] for r in rutas.values())
-total_vol = clientes_seleccionados['Volumen estimado en litros'].sum()
-tiempo_prom = sum(r['tiempo'] for r in rutas.values()) / NUM_CAMIONES
-truck_fill_total = (total_vol / (CAPACIDAD_CAMION * NUM_CAMIONES)) * 100
-
-with col1:
-    st.metric("👥 Clientes", "50")
-with col2:
-    st.metric("📦 Volumen Total", f"{total_vol:,} L")
-with col3:
-    st.metric("🛣️ Km Totales", f"{total_km:.1f} km")
-with col4:
-    st.metric("⏱️ Tiempo Prom.", f"{tiempo_prom/60:.1f} hrs")
-with col5:
-    st.metric("📊 Fill Total", f"{truck_fill_total:.1f}%")
-
-st.markdown("---")
-
-# Métricas por Unidad
-st.subheader("🚚 Indicadores por Unidad")
-cols = st.columns(NUM_CAMIONES)
-
-for c, col in enumerate(cols):
-    with col:
-        vol = rutas[c]['clientes']['Volumen estimado en litros'].sum() if not rutas[c]['clientes'].empty else 0
-        clientes = len(rutas[c]['clientes'])
-        fill = (vol / CAPACIDAD_CAMION) * 100
-        eficiencia = vol / rutas[c]['distancia'] if rutas[c]['distancia'] > 0 else 0
-        
-        st.markdown(f"### Unidad {c+1}")
-        st.metric("Clientes", clientes)
-        st.metric("Volumen", f"{vol} L")
-        st.metric("Truck Fill", f"{fill:.1f}%")
-        st.metric("Eficiencia", f"{eficiencia:.1f} L/km")
-        st.metric("Distancia", f"{rutas[c]['distancia']:.1f} km")
-        st.metric("Tiempo", f"{rutas[c]['tiempo']/60:.1f} hrs")
-        
-        # Validación
-        cumple_cap = "✅" if vol <= CAPACIDAD_CAMION else "❌"
-        cumple_tiempo = "✅" if rutas[c]['tiempo'] <= JORNADA_MAXIMA else "❌"
-        st.caption(f"Capacidad: {cumple_cap} | Tiempo: {cumple_tiempo}")
-
-st.markdown("---")
-
-# Gráficos
-st.subheader("📊 Análisis Visual")
-col_g1, col_g2 = st.columns(2)
-
-with col_g1:
-    # Gráfico de Truck Fill por unidad
-    fig_fill = go.Figure()
-    for c in range(NUM_CAMIONES):
-        vol = rutas[c]['clientes']['Volumen estimado en litros'].sum() if not rutas[c]['clientes'].empty else 0
-        fill = (vol / CAPACIDAD_CAMION) * 100
-        fig_fill.add_trace(go.Bar(
-            x=[f"Unidad {c+1}"],
-            y=[fill],
-            marker_color=COLORES[c],
-            name=f"Unidad {c+1}"
-        ))
-    fig_fill.update_layout(title="Truck Fill por Unidad (%)", yaxis_title="%", showlegend=False)
-    fig_fill.add_hline(y=100, line_dash="dash", line_color="red", annotation_text="Capacidad máxima")
-    st.plotly_chart(fig_fill, use_container_width=True)
-
-with col_g2:
-    # Gráfico de distribución de clientes
-    clientes_por_ruta = [len(rutas[c]['clientes']) for c in range(NUM_CAMIONES)]
-    fig_clientes = go.Figure(data=[go.Pie(
-        labels=[f"Unidad {c+1}" for c in range(NUM_CAMIONES)],
-        values=clientes_por_ruta,
-        marker_colors=COLORES,
-        hole=0.4
-    )])
-    fig_clientes.update_layout(title="Distribución de Clientes por Unidad")
-    st.plotly_chart(fig_clientes, use_container_width=True)
-
-col_g3, col_g4 = st.columns(2)
-
-with col_g3:
-    # Gráfico de km por unidad
-    km_por_ruta = [rutas[c]['distancia'] for c in range(NUM_CAMIONES)]
-    fig_km = go.Figure()
-    for c in range(NUM_CAMIONES):
-        fig_km.add_trace(go.Bar(
-            x=[f"Unidad {c+1}"],
-            y=[km_por_ruta[c]],
-            marker_color=COLORES[c],
-            name=f"Unidad {c+1}"
-        ))
-    fig_km.update_layout(title="Kilómetros por Unidad", yaxis_title="km", showlegend=False)
-    st.plotly_chart(fig_km, use_container_width=True)
-
-with col_g4:
-    # Gráfico de tiempo por unidad
-    tiempo_por_ruta = [rutas[c]['tiempo']/60 for c in range(NUM_CAMIONES)]
-    fig_tiempo = go.Figure()
-    for c in range(NUM_CAMIONES):
-        fig_tiempo.add_trace(go.Bar(
-            x=[f"Unidad {c+1}"],
-            y=[tiempo_por_ruta[c]],
-            marker_color=COLORES[c],
-            name=f"Unidad {c+1}"
-        ))
-    fig_tiempo.update_layout(title="Tiempo por Unidad (hrs)", yaxis_title="Horas", showlegend=False)
-    fig_tiempo.add_hline(y=10.5, line_dash="dash", line_color="red", annotation_text="Jornada máxima")
-    st.plotly_chart(fig_tiempo, use_container_width=True)
-
-st.markdown("---")
-
-# Mapa
-st.subheader("🗺️ Mapa de Rutas")
-mapa = crear_mapa(df_optimizado, rutas)
-st_folium(mapa, width=None, height=500)
-
-st.markdown("---")
-
-# Detalle de rutas
-st.subheader("📋 Detalle de Entregas por Unidad")
-
-tabs = st.tabs([f"🚚 Unidad {i+1}" for i in range(NUM_CAMIONES)])
-
-for c, tab in enumerate(tabs):
-    with tab:
-        if rutas[c]['clientes'].empty:
-            st.warning("Sin clientes asignados")
-        else:
-            df_ruta = rutas[c]['clientes'][['Orden', 'NombreCliente', 'Direccion', 'Volumen estimado en litros', 'VentanaServicio', 'Hora Llegada']].copy()
-            df_ruta.columns = ['#', 'Cliente', 'Dirección', 'Volumen (L)', 'Ventana Servicio', 'Hora Llegada']
-            
-            st.dataframe(df_ruta, hide_index=True, use_container_width=True, height=400)
-
-st.markdown("---")
-
-# Exportar reporte
-st.subheader("📥 Exportar Reporte")
-col_exp1, col_exp2 = st.columns(2)
-
-# Generar resumen para exportar
-resumen_data = []
-for c in range(NUM_CAMIONES):
-    vol = rutas[c]['clientes']['Volumen estimado en litros'].sum() if not rutas[c]['clientes'].empty else 0
-    resumen_data.append({
-        'Unidad': c + 1,
-        'Clientes': len(rutas[c]['clientes']),
-        'Volumen (L)': vol,
-        'Truck Fill (%)': round((vol / CAPACIDAD_CAMION) * 100, 1),
-        'Distancia (km)': round(rutas[c]['distancia'], 2),
-        'Tiempo (hrs)': round(rutas[c]['tiempo'] / 60, 2),
-        'Cumple Capacidad': 'Sí' if vol <= CAPACIDAD_CAMION else 'No',
-        'Cumple Tiempo': 'Sí' if rutas[c]['tiempo'] <= JORNADA_MAXIMA else 'No'
-    })
-
-df_resumen = pd.DataFrame(resumen_data)
-
-with col_exp1:
-    csv_resumen = df_resumen.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        "📊 Descargar KPIs (CSV)",
-        csv_resumen,
-        f"kpis_rutas_{st.session_state['seed']}.csv",
-        "text/csv",
-        use_container_width=True
+    st.markdown("**Fleet**")
+    num_vehicles = st.slider("🚚 Number of trucks", min_value=1, max_value=8, value=4, step=1)
+    capacity = st.slider(
+        "📦 Truck capacity (L)",
+        min_value=4000,
+        max_value=24000,
+        value=12000,
+        step=1000,
     )
 
-with col_exp2:
-    # Combinar todas las rutas
-    all_rutas = []
-    for c in range(NUM_CAMIONES):
-        if not rutas[c]['clientes'].empty:
-            df_temp = rutas[c]['clientes'][['Orden', 'NombreCliente', 'Direccion', 'Volumen estimado en litros', 'VentanaServicio', 'Hora Llegada']].copy()
-            df_temp['Unidad'] = c + 1
-            all_rutas.append(df_temp)
-    
-    if all_rutas:
-        df_todas_rutas = pd.concat(all_rutas, ignore_index=True)
-        csv_rutas = df_todas_rutas.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "🚚 Descargar Rutas (CSV)",
-            csv_rutas,
-            f"rutas_distribucion_{st.session_state['seed']}.csv",
-            "text/csv",
-            use_container_width=True
-        )
+    st.markdown("**Shift / SLA**")
+    sla_hours = st.slider(
+        "🕐 Shift length / SLA (hours)",
+        min_value=6.0,
+        max_value=14.0,
+        value=10.5,
+        step=0.5,
+        help="Total working window from the depart time. Time windows are enforced within this shift.",
+    )
+    shift_minutes = int(round(sla_hours * 60))
+    service_time = st.slider("⏱️ Service time per client (min)", min_value=0, max_value=30, value=10, step=1)
 
-st.info("💡 **Tip:** Para exportar a PDF, usa Ctrl+P (o Cmd+P en Mac) en el navegador y selecciona 'Guardar como PDF'")
+    st.markdown("**Distance provider**")
+    provider_label = st.radio(
+        "How to measure distances",
+        options=["Haversine (straight-line)", "OSRM (road distances)"],
+        index=0,
+        help=(
+            "Haversine is instant and offline (great-circle km). OSRM queries a "
+            "public routing server for real driving distances/durations and "
+            "falls back to Haversine automatically if it is unavailable."
+        ),
+    )
+    provider = PROVIDER_OSRM if provider_label.startswith("OSRM") else PROVIDER_HAVERSINE
+
+    st.markdown("**Client set**")
+    max_clients = min(n_available, 120)
+    n_clients = st.slider(
+        "👥 Clients to route",
+        min_value=5,
+        max_value=max_clients,
+        value=min(50, max_clients),
+        step=5,
+    )
+    if "seed" not in st.session_state:
+        st.session_state["seed"] = 42
+    if st.button("🎲 New random client set", use_container_width=True):
+        st.session_state["seed"] = int(np.random.randint(1, 10_000))
+    st.caption(f"Client sample #{st.session_state['seed']} · {n_available} synthetic clients available")
+
+    st.markdown("---")
+    run = st.button("▶️ Optimize routes", type="primary", use_container_width=True)
+
+    st.markdown("---")
+    st.caption(
+        f"Depot near Toluca · depart {DEPART}\n\n"
+        "CVRPTW solved with Google OR-Tools (guided local search). "
+        "Baseline = K-Means + nearest-neighbor, time windows ignored."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+st.title("🚚 Route Optimizer V2 — CVRPTW")
+st.markdown(
+    "Capacitated Vehicle Routing **with Time Windows**, solved with Google OR-Tools and "
+    "benchmarked against a naive K-Means baseline. Tune the parameters in the sidebar and "
+    "press **Optimize routes**."
+)
+
+# Sample the client set (deterministic on the seed so reruns are stable).
+clients = (
+    df_full.sample(n=n_clients, random_state=st.session_state["seed"])
+    .reset_index(drop=True)
+)
+
+if not run and "last_result" not in st.session_state:
+    st.info(
+        "👈 Set your fleet, shift/SLA, and distance provider in the sidebar, then press "
+        "**Optimize routes** to run the baseline and the OR-Tools CVRPTW solver."
+    )
+    st.stop()
+
+if run:
+    signature = (
+        st.session_state["seed"],
+        n_clients,
+        provider,
+        num_vehicles,
+        capacity,
+        service_time,
+        shift_minutes,
+    )
+    with st.spinner("Running baseline and OR-Tools CVRPTW solver…"):
+        try:
+            result = _solve_both(
+                signature,
+                clients,
+                provider,
+                num_vehicles,
+                capacity,
+                service_time,
+                shift_minutes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"The optimizer raised an error:\n\n`{exc}`")
+            st.stop()
+    st.session_state["last_result"] = result
+    st.session_state["last_clients"] = clients
+
+result = st.session_state["last_result"]
+clients = st.session_state["last_clients"]
+baseline_sol, optimized_sol, baseline_kpis, optimized_kpis, bench = result
+
+provider_used = getattr(optimized_sol, "provider_used", provider)
+
+# OSRM fallback note.
+if provider == PROVIDER_OSRM and provider_used != PROVIDER_OSRM:
+    st.warning(
+        "🌐 OSRM road distances were requested but the routing server was "
+        "unavailable or rate-limited, so distances fell back to **Haversine** "
+        "(straight-line). Results below use the Haversine matrix."
+    )
+else:
+    provider_pretty = "OSRM road distances" if provider_used == PROVIDER_OSRM else "Haversine (straight-line)"
+    st.caption(f"Distance provider in use: **{provider_pretty}**")
+
+
+# ===========================================================================
+# 1) BASELINE vs OPTIMIZED benchmark
+# ===========================================================================
+st.subheader("📊 Baseline vs Optimized")
+
+baseline_km = bench.get("baseline_km", getattr(baseline_sol, "total_distance_km", 0.0))
+optimized_km = bench.get("optimized_km", getattr(optimized_sol, "total_distance_km", 0.0))
+km_saved_pct = bench.get("km_saved_pct")
+if km_saved_pct is None:
+    km_saved_pct = ((baseline_km - optimized_km) / baseline_km * 100.0) if baseline_km else 0.0
+
+base_viol = bench.get(
+    "baseline_window_violations",
+    baseline_kpis.get("window_violations", baseline_kpis.get("global", {}).get("window_violations", 0)),
+)
+opt_viol = bench.get(
+    "optimized_window_violations",
+    optimized_kpis.get("window_violations", optimized_kpis.get("global", {}).get("window_violations", 0)),
+)
+
+baseline_time = getattr(baseline_sol, "total_time_min", 0.0)
+optimized_time = getattr(optimized_sol, "total_time_min", 0.0)
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric(
+        "🛣️ Total distance",
+        f"{optimized_km:,.1f} km",
+        delta=f"-{km_saved_pct:.1f}% vs baseline",
+        delta_color="inverse",
+        help=f"Baseline drives {baseline_km:,.1f} km; the optimizer drives {optimized_km:,.1f} km.",
+    )
+with c2:
+    st.metric("📉 Baseline distance", f"{baseline_km:,.1f} km", help="Naive K-Means + nearest-neighbor, time windows ignored.")
+with c3:
+    time_delta = optimized_time - baseline_time
+    st.metric(
+        "⏱️ Total route time",
+        f"{_minutes_to_hrs(optimized_time):.1f} h",
+        delta=f"{time_delta/60:+.1f} h vs baseline",
+        delta_color="inverse",
+    )
+with c4:
+    st.metric(
+        "⏰ Window violations",
+        f"{int(opt_viol)}",
+        delta=f"{int(opt_viol) - int(base_viol):+d} vs baseline ({int(base_viol)})",
+        delta_color="inverse",
+        help="Deliveries that arrive outside the client's service window. The CVRPTW solver enforces windows as hard constraints.",
+    )
+
+dropped = getattr(optimized_sol, "dropped", []) or []
+if dropped:
+    st.info(
+        f"ℹ️ The solver dropped **{len(dropped)}** client(s) it could not serve within capacity "
+        "and time windows (they carry a penalty rather than making the whole plan infeasible). "
+        "Add a truck, raise capacity, or extend the shift to serve them."
+    )
 
 st.markdown("---")
-st.caption(f"🎲 Grupo #{st.session_state['seed']} | Generado: {datetime.now().strftime('%H:%M:%S')} | Clientes válidos: {len(df)}")
+
+
+# ===========================================================================
+# 2) OPTIMIZED KPIs — global + per truck
+# ===========================================================================
+def _global_kpis(k: dict) -> dict:
+    """Return the global KPI block whether it is nested under 'global' or flat."""
+    if isinstance(k, dict) and isinstance(k.get("global"), dict):
+        return k["global"]
+    return k
+
+
+gk = _global_kpis(optimized_kpis)
+routes = getattr(optimized_sol, "routes", []) or []
+per_vehicle = getattr(optimized_sol, "per_vehicle", []) or []
+
+st.subheader("📈 Optimized plan — global KPIs")
+g1, g2, g3, g4, g5 = st.columns(5)
+total_vol = float(clients["Volumen estimado en litros"].sum())
+active_trucks = sum(1 for r in routes if r)
+with g1:
+    st.metric("👥 Clients served", f"{sum(len(r) for r in routes)}")
+with g2:
+    st.metric("🚚 Trucks used", f"{active_trucks} / {num_vehicles}")
+with g3:
+    st.metric("📦 Volume routed", f"{total_vol:,.0f} L")
+with g4:
+    fleet_fill = gk.get("fleet_fill_pct")
+    if fleet_fill is None:
+        fleet_fill = (total_vol / (capacity * max(active_trucks, 1))) * 100.0
+    st.metric("📊 Fleet fill", f"{float(fleet_fill):.1f}%")
+with g5:
+    feasible = getattr(optimized_sol, "feasible", True)
+    st.metric("✅ Feasible", "Yes" if feasible else "No")
+
+st.markdown("#### 🚚 Per-truck indicators")
+if active_trucks == 0:
+    st.warning("No routes were produced for the current parameters.")
+else:
+    cols = st.columns(min(active_trucks, 4) or 1)
+    shown = 0
+    for v, route in enumerate(routes):
+        if not route:
+            continue
+        pv = per_vehicle[v] if v < len(per_vehicle) else {}
+        col = cols[shown % len(cols)]
+        shown += 1
+        with col:
+            st.markdown(f"**Truck {v + 1}**")
+            load = pv.get("load", float(clients.iloc[route]["Volumen estimado en litros"].sum()))
+            dist_km = pv.get("distance_km", 0.0)
+            time_min = pv.get("time_min", 0.0)
+            fill = (load / capacity * 100.0) if capacity else 0.0
+            eff = (load / dist_km) if dist_km else 0.0
+            st.metric("Stops", pv.get("stops", len(route)))
+            st.metric("Load", f"{load:,.0f} L")
+            st.metric("Truck fill", f"{fill:.1f}%")
+            st.metric("Distance", f"{dist_km:,.1f} km")
+            st.metric("Time", f"{_minutes_to_hrs(time_min):.1f} h")
+            st.metric("Efficiency", f"{eff:.1f} L/km")
+            cap_ok = pv.get("cap_ok", load <= capacity)
+            time_ok = pv.get("time_ok", time_min <= shift_minutes)
+            win_v = int(pv.get("window_violations", 0))
+            st.caption(
+                f"Capacity {'✅' if cap_ok else '❌'} · "
+                f"Time {'✅' if time_ok else '❌'} · "
+                f"Windows {'✅' if win_v == 0 else f'❌ {win_v}'}"
+            )
+
+st.markdown("---")
+
+
+# ===========================================================================
+# 3) Charts — per-truck fill %, km, time (baseline vs optimized where useful)
+# ===========================================================================
+st.subheader("📊 Charts")
+
+
+def _series(sol, key: str):
+    vals = []
+    for v, route in enumerate(getattr(sol, "routes", []) or []):
+        pv_list = getattr(sol, "per_vehicle", []) or []
+        pv = pv_list[v] if v < len(pv_list) else {}
+        vals.append(pv.get(key, 0.0))
+    return vals
+
+
+labels = [f"Truck {i + 1}" for i in range(len(routes))]
+
+chart_col1, chart_col2 = st.columns(2)
+
+with chart_col1:
+    fills = []
+    for v, route in enumerate(routes):
+        pv = per_vehicle[v] if v < len(per_vehicle) else {}
+        load = pv.get("load", 0.0)
+        fills.append((load / capacity * 100.0) if capacity else 0.0)
+    fig_fill = go.Figure()
+    fig_fill.add_trace(go.Bar(x=labels, y=fills, marker_color=[_color(i) for i in range(len(labels))]))
+    fig_fill.add_hline(y=100, line_dash="dash", line_color="red", annotation_text="Capacity")
+    fig_fill.update_layout(title="Truck fill (%)", yaxis_title="%", showlegend=False, margin=dict(t=40, b=10))
+    st.plotly_chart(fig_fill, use_container_width=True)
+
+with chart_col2:
+    kms = _series(optimized_sol, "distance_km")
+    fig_km = go.Figure()
+    fig_km.add_trace(go.Bar(x=labels, y=kms, marker_color=[_color(i) for i in range(len(labels))]))
+    fig_km.update_layout(title="Distance per truck (km)", yaxis_title="km", showlegend=False, margin=dict(t=40, b=10))
+    st.plotly_chart(fig_km, use_container_width=True)
+
+chart_col3, chart_col4 = st.columns(2)
+
+with chart_col3:
+    times = [_minutes_to_hrs(t) for t in _series(optimized_sol, "time_min")]
+    fig_time = go.Figure()
+    fig_time.add_trace(go.Bar(x=labels, y=times, marker_color=[_color(i) for i in range(len(labels))]))
+    fig_time.add_hline(y=sla_hours, line_dash="dash", line_color="red", annotation_text="Shift limit")
+    fig_time.update_layout(title="Time per truck (hours)", yaxis_title="Hours", showlegend=False, margin=dict(t=40, b=10))
+    st.plotly_chart(fig_time, use_container_width=True)
+
+with chart_col4:
+    # Baseline vs optimized total distance, side by side.
+    fig_cmp = go.Figure()
+    fig_cmp.add_trace(go.Bar(x=["Baseline", "Optimized"], y=[baseline_km, optimized_km],
+                             marker_color=["#95a5a6", "#2ecc71"],
+                             text=[f"{baseline_km:,.0f}", f"{optimized_km:,.0f}"], textposition="auto"))
+    fig_cmp.update_layout(title=f"Total distance — {km_saved_pct:.1f}% saved", yaxis_title="km",
+                          showlegend=False, margin=dict(t=40, b=10))
+    st.plotly_chart(fig_cmp, use_container_width=True)
+
+st.markdown("---")
+
+
+# ===========================================================================
+# 4) Map — optimized routes
+# ===========================================================================
+st.subheader("🗺️ Optimized routes")
+
+
+def _build_map(sol, df):
+    m = folium.Map(location=[DEPOT_LAT, DEPOT_LON], zoom_start=11, tiles="CartoDB positron")
+    folium.Marker(
+        [DEPOT_LAT, DEPOT_LON],
+        popup="Distribution center (depot)",
+        tooltip="Depot",
+        icon=folium.Icon(color="black", icon="home", prefix="fa"),
+    ).add_to(m)
+
+    routes_ = getattr(sol, "routes", []) or []
+    pv_list = getattr(sol, "per_vehicle", []) or []
+
+    for v, route in enumerate(routes_):
+        if not route:
+            continue
+        color = _color(v)
+        pv = pv_list[v] if v < len(pv_list) else {}
+        arrivals = pv.get("arrivals", []) or []
+
+        path = [[DEPOT_LAT, DEPOT_LON]]
+        for order, row_idx in enumerate(route):
+            client = df.iloc[row_idx]
+            lat, lon = float(client["Latitud"]), float(client["Longitud"])
+            path.append([lat, lon])
+            arr = arrivals[order] if order < len(arrivals) else None
+            arr_str = _fmt_hhmm(arr) if arr is not None else "—"
+            popup_html = (
+                f'<div style="width:260px;font-family:Arial;">'
+                f'<div style="background:{color};color:#fff;padding:6px 8px;'
+                f'border-radius:4px 4px 0 0;"><b>🚚 Truck {v + 1} · Stop {order + 1}</b></div>'
+                f'<table style="width:100%;font-size:12px;margin-top:6px;">'
+                f'<tr><td><b>Client</b></td><td>{client["NombreCliente"]}</td></tr>'
+                f'<tr><td><b>Volume</b></td><td>{client["Volumen estimado en litros"]} L</td></tr>'
+                f'<tr><td><b>Window</b></td><td>{client["VentanaServicio"]}</td></tr>'
+                f'<tr><td><b>Arrival</b></td><td><b style="color:{color}">{arr_str}</b></td></tr>'
+                f"</table></div>"
+            )
+            folium.CircleMarker(
+                [lat, lon],
+                radius=7,
+                color=color,
+                fill=True,
+                fill_opacity=0.85,
+                popup=folium.Popup(popup_html, max_width=300),
+                tooltip=f"Truck {v + 1} · Stop {order + 1} · {client['NombreCliente']} · {arr_str}",
+            ).add_to(m)
+        path.append([DEPOT_LAT, DEPOT_LON])
+        folium.PolyLine(path, color=color, weight=3, opacity=0.8, tooltip=f"Truck {v + 1}").add_to(m)
+
+    # Mark any dropped clients in grey so they are visible on the map.
+    for row_idx in getattr(sol, "dropped", []) or []:
+        client = df.iloc[row_idx]
+        folium.CircleMarker(
+            [float(client["Latitud"]), float(client["Longitud"])],
+            radius=6,
+            color="#7f8c8d",
+            fill=True,
+            fill_opacity=0.6,
+            tooltip=f"DROPPED · {client['NombreCliente']}",
+        ).add_to(m)
+    return m
+
+
+st_folium(_build_map(optimized_sol, clients), width=None, height=520, returned_objects=[])
+
+st.markdown("---")
+
+
+# ===========================================================================
+# 5) Route tables + export
+# ===========================================================================
+st.subheader("📋 Route detail")
+
+active = [v for v, r in enumerate(routes) if r]
+if not active:
+    st.warning("No routes to display.")
+else:
+    tabs = st.tabs([f"🚚 Truck {v + 1}" for v in active])
+    export_frames = []
+    for tab, v in zip(tabs, active):
+        route = routes[v]
+        pv = per_vehicle[v] if v < len(per_vehicle) else {}
+        arrivals = pv.get("arrivals", []) or []
+        with tab:
+            rows = []
+            for order, row_idx in enumerate(route):
+                client = clients.iloc[row_idx]
+                arr = arrivals[order] if order < len(arrivals) else None
+                rows.append(
+                    {
+                        "#": order + 1,
+                        "Client": client["NombreCliente"],
+                        "Address": str(client["Direccion"])[:60],
+                        "Volume (L)": client["Volumen estimado en litros"],
+                        "Window": client["VentanaServicio"],
+                        "Arrival": _fmt_hhmm(arr) if arr is not None else "—",
+                    }
+                )
+            table = pd.DataFrame(rows)
+            st.dataframe(table, hide_index=True, use_container_width=True, height=360)
+            frame = table.copy()
+            frame.insert(0, "Truck", v + 1)
+            export_frames.append(frame)
+
+    if export_frames:
+        all_routes = pd.concat(export_frames, ignore_index=True)
+        csv_bytes = all_routes.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download optimized routes (CSV)",
+            csv_bytes,
+            file_name=f"optimized_routes_seed{st.session_state['seed']}.csv",
+            mime="text/csv",
+        )
+
+st.markdown("---")
+st.caption(
+    "100% synthetic data · CVRPTW solved with Google OR-Tools · "
+    "distances via Haversine or OSRM · Eduardo Perry Rangel (github.com/Teshre)"
+)

@@ -7,8 +7,8 @@ on:
     branches: ["**"]
 
 jobs:
-  smoke:
-    name: Build & smoke test
+  test:
+    name: Build & test
     runs-on: ubuntu-latest
 
     steps:
@@ -30,7 +30,12 @@ jobs:
         run: python data/generate_data.py
 
       - name: Byte-compile Python sources (smoke check)
-        run: python -m py_compile app.py route_optimizer.py data/generate_data.py
+        run: python -m py_compile app.py data/generate_data.py
+
+      - name: Run pytest
+        env:
+          PYTHONPATH: src
+        run: pytest -q
 
       - name: Guard against real / branded data
         run: |

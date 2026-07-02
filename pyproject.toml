@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "route-optimizer"
+version = "2.0.0"
+description = "Capacitated VRP with Time Windows (CVRPTW) route optimizer — OR-Tools + OSRM, with a baseline benchmark and Streamlit dashboard."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ortools",
+    "requests",
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "folium",
+    "streamlit",
+    "streamlit-folium",
+    "plotly",
+    "faker",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+route-optimizer = "route_optimizer.cli:main"
+
+# The importable package lives under src/ (src-layout). This makes the
+# `route_optimizer` package unambiguous and avoids the legacy V1
+# `route_optimizer.py` at the repo root shadowing it.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

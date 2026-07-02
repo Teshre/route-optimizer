@@ -1,10 +1,11 @@
-streamlit
+ortools
+requests
 pandas
 numpy
 scikit-learn
 folium
+streamlit
 streamlit-folium
 plotly
-matplotlib
-seaborn
 faker
+pytest

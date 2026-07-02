@@ -1,4 +1,4 @@
-# Route Optimizer — developer tasks
+# Route Optimizer V2 — developer tasks
 # Usage: `make help` to list targets.
 
 # Use the venv's interpreters when present, fall back to system Python otherwise.
@@ -6,12 +6,17 @@ VENV        ?= .venv
 PY          := $(VENV)/bin/python
 PIP         := $(VENV)/bin/pip
 STREAMLIT   := $(VENV)/bin/streamlit
+PYTEST      := $(VENV)/bin/pytest
+
+# The importable package lives under src/ (src-layout), so the CLI and tests
+# need src on PYTHONPATH.
+export PYTHONPATH := src
 
 .DEFAULT_GOAL := help
-.PHONY: help setup data app analysis clean
+.PHONY: help setup data app cli test clean
 
 help: ## Show this help
-	@echo "Route Optimizer — available targets:"
+	@echo "Route Optimizer V2 — available targets:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 	@echo ""
@@ -29,10 +34,13 @@ data: ## Generate the synthetic client dataset (data/clientes.csv)
 app: ## Launch the interactive Streamlit dashboard
 	$(STREAMLIT) run app.py
 
-analysis: ## Run the standalone CLI analysis (KPIs, charts, map)
-	$(PY) route_optimizer.py
+cli: ## Run the CVRPTW benchmark from the command line (baseline vs optimized + KPIs)
+	$(PY) -m route_optimizer.cli
+
+test: ## Run the pytest suite
+	$(PYTEST) -q
 
 clean: ## Remove generated output and Python caches
-	rm -rf resultados out
+	rm -rf out resultados .pytest_cache
 	find . -type d -name '__pycache__' -not -path './$(VENV)/*' -exec rm -rf {} +
 	@echo "✓ Cleaned generated output and caches"
