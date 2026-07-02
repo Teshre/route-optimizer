@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+
+# Environment / secrets
+.env
+
+# Generated output
+resultados/
+out/
+
+# Safety net: never commit the original real dataset
+Datos-1.csv
+Datos*.csv
