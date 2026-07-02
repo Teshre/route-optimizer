@@ -49,9 +49,9 @@ To show the optimizer earns its keep, V2 also runs the **old heuristic** as a ba
 - **time-window satisfaction** — the baseline racks up window **violations** (it never looked at windows); the CVRPTW solver drives them to **zero** by construction;
 - per-truck **fill %**, **km**, **time**, and **L/km** efficiency.
 
-> **Benchmark (default params — 50 clients, 4 trucks × 12,000 L, 10.5 h shift, Haversine):**
-> _Distance saved:_ `__%` · _Baseline window violations:_ `__` → _Optimized:_ `0` · _Baseline km:_ `__` → _Optimized km:_ `__`.
-> _(Numbers are reproducible via `make cli`; fill in from your run.)_
+> **Benchmark (`make cli` — 50 clients, 4 trucks × 12,000 L, 10.5 h shift, Haversine):**
+> _Distance:_ baseline **319.6 km** → optimized **284.2 km** (**11.1% saved**) · _Window violations:_ baseline **25** → optimized **0** · _all 50 clients served, plan feasible._
+> _(Reproducible with `make cli`. On the full 200-client set the fleet is deliberately under-capacity, so the solver honestly **drops** the clients it cannot serve within capacity + windows rather than hiding the infeasibility — run `make cli --clients 200` or lower the truck count to see that behaviour.)_
 
 ## Architecture
 

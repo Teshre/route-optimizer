@@ -110,10 +110,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--service-time", type=int, default=SERVICE_TIME_MIN)
     parser.add_argument("--shift-minutes", type=int, default=SHIFT_MINUTES)
     parser.add_argument("--time-limit", type=int, default=5)
+    parser.add_argument("--clients", type=int, default=50,
+                        help="Sample this many clients (feasible demo benchmark); 0 = use all rows")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", default=str(PROJECT_ROOT / "out"))
     args = parser.parse_args(argv)
 
     df = load_clients(args.csv)
+    if args.clients and 0 < args.clients < len(df):
+        df = df.sample(n=args.clients, random_state=args.seed).reset_index(drop=True)
     print(f"Loaded {len(df)} clients from {args.csv}")
 
     # Build ONE matrix and share it, so baseline and optimizer are compared on
